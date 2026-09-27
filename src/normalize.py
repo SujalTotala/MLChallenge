@@ -1,6 +1,7 @@
 """
 Comprehensive text normalization and structured representation extraction engine.
-Supports open-set country representations and multi-channel entity features.
+Supports open-set country representations, legal suffixes (EN, DE, FR), DBA markers,
+Indian/Indic transliterations, and multi-channel entity features.
 """
 
 import re
@@ -13,6 +14,9 @@ RE_WHITESPACE = re.compile(r"\s+")
 RE_NUMBERS = re.compile(r"\b\d+\b")
 RE_ALNUM_ONLY = re.compile(r"[^a-z0-9]")
 
+# DBA / Trade name markers
+RE_DBA_MARKERS = re.compile(r"\b(d/?b/?a|doing\s+business\s+as|t/?a|trading\s+as|f/?k/?a|formerly\s+known\s+as|c/?o|care\s+of|proprietorship|prop)\b", re.IGNORECASE)
+
 # Geo pattern matchers
 RE_PINCODE_IN = re.compile(r"\b[1-9][0-9]{5}\b")  # India 6-digit PIN
 RE_ZIPCODE_US_FR = re.compile(r"\b\d{5}\b")        # US 5-digit ZIP / France 5-digit Code Postal
@@ -24,7 +28,7 @@ US_STATES = {
     "va", "wa", "wv", "wi", "wy", "dc", "pr"
 }
 
-# Legal business suffix regex patterns
+# Legal business suffix regex patterns (English, German, French)
 LEGAL_SUFFIX_PATTERNS = [
     r"\bprivate\s+limited\b",
     r"\bpvt\s+ltd\b",
@@ -40,8 +44,8 @@ LEGAL_SUFFIX_PATTERNS = [
     r"\bltd\b",
     r"\bgmbh\b",
     r"\bs\.?a\.?s\.?\b",
+    r"\bs\.?a\.?r\.?l\.?\b",
     r"\bs\.?a\.?\b",
-    r"\bsarl\b",
     r"\bco\b",
     r"\bcompany\b",
     r"\benterprises?\b",
@@ -129,21 +133,17 @@ def clean_text_basic(text: Any) -> str:
     """
     Basic text cleaning:
     - Lowercase
-    - Unicode NFKD normalization
+    - Unicode NFKD normalization (converts Café -> cafe, Société -> societe)
     - Expand & -> and, @ -> at
-    - Replace punctuation with spaces
-    - Collapse extra whitespace
+    - Remove punctuation
+    - Collapse whitespace
     """
     if is_missing(text):
         return ""
     
-    # 1. Convert to string and lowercase
     text = str(text).lower()
-    
-    # 2. Unicode normalization (convert accents/diacritics e.g., French 'Café' -> 'cafe')
     text = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("utf-8")
     
-    # 3. Expand common symbol words
     if "&" in text:
         text = text.replace("&", " and ")
     if "@" in text:
@@ -151,10 +151,7 @@ def clean_text_basic(text: Any) -> str:
     if "#" in text:
         text = text.replace("#", " ")
         
-    # 4. Remove punctuation
     text = RE_PUNCT.sub(" ", text)
-    
-    # 5. Collapse spaces
     return RE_WHITESPACE.sub(" ", text).strip()
 
 
@@ -166,6 +163,16 @@ def strip_legal_suffixes(name: str) -> str:
     for pattern in COMPILED_LEGAL_SUFFIXES:
         cleaned = pattern.sub(" ", cleaned)
     return RE_WHITESPACE.sub(" ", cleaned).strip()
+
+
+def extract_primary_name(name: str) -> str:
+    """Extract primary business name if DBA marker is present."""
+    if not name:
+        return ""
+    parts = RE_DBA_MARKERS.split(name)
+    if parts:
+        return parts[0].strip()
+    return name
 
 
 def normalize_name(name_str: Any) -> Dict[str, Any]:
@@ -193,10 +200,11 @@ def normalize_name(name_str: Any) -> Dict[str, Any]:
             "name_first_tokens": "",
         }
     
-    # Strip legal suffixes for core name
-    core = strip_legal_suffixes(norm)
+    # Handle DBA / Trade name markers
+    primary = extract_primary_name(norm)
+    core = strip_legal_suffixes(primary)
     if not core:
-        core = norm
+        core = strip_legal_suffixes(norm) or norm
         
     tokens = [t for t in core.split() if t]
     sorted_tokens = sorted(tokens)
@@ -251,7 +259,7 @@ def normalize_address(address_str: Any, country_norm: str = "unknown") -> Dict[s
             "address_compact": "",
         }
     
-    # Expand address abbreviations
+    # Expand address abbreviations & city aliases
     padded = f" {norm} "
     for old, new in ADDRESS_REPLACEMENTS.items():
         if old in padded:
@@ -259,11 +267,8 @@ def normalize_address(address_str: Any, country_norm: str = "unknown") -> Dict[s
     norm = RE_WHITESPACE.sub(" ", padded).strip()
     
     tokens = [t for t in norm.split() if t]
-    
-    # Extract numbers (house numbers, suite numbers)
     numbers = RE_NUMBERS.findall(norm)
     
-    # Extract postal code (India: 6-digit, US/France: 5-digit)
     postal_code = ""
     if country_norm == "india":
         pins = RE_PINCODE_IN.findall(norm)
@@ -274,7 +279,6 @@ def normalize_address(address_str: Any, country_norm: str = "unknown") -> Dict[s
         if zips:
             postal_code = zips[0]
     else:
-        # Fallback geo check
         pins = RE_PINCODE_IN.findall(norm)
         if pins:
             postal_code = pins[0]
@@ -283,7 +287,6 @@ def normalize_address(address_str: Any, country_norm: str = "unknown") -> Dict[s
             if zips:
                 postal_code = zips[0]
 
-    # Extract state if US
     state = ""
     if country_norm == "us":
         for t in tokens:
@@ -291,7 +294,6 @@ def normalize_address(address_str: Any, country_norm: str = "unknown") -> Dict[s
                 state = t
                 break
 
-    # Non-numeric street tokens
     street_tokens = [t for t in tokens if not t.isdigit() and len(t) >= 3]
     compact = RE_ALNUM_ONLY.sub("", norm)
 
@@ -300,7 +302,7 @@ def normalize_address(address_str: Any, country_norm: str = "unknown") -> Dict[s
         "address_tokens": tokens,
         "house_number": numbers,
         "postal_code": postal_code,
-        "city": "",  # Extracted if available in data
+        "city": "",
         "state": state,
         "street_tokens": street_tokens,
         "address_compact": compact,

@@ -1,0 +1,2 @@
+macro_f05,macro_precision,macro_recall,singleton_accuracy,best_threshold,best_margin,total_evaluated_s1
+0.9590581138448038,0.9801535714285714,0.9213083333333333,0.927536231884058,0.98,0.0,1000

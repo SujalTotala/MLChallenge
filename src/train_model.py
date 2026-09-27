@@ -1,6 +1,7 @@
 """
 Model training, entity-level validation, threshold optimization, and singleton-aware decision tuning.
 Uses MIT-licensed LightGBM classifier for scalable, high-precision entity resolution.
+Exports reports/validation_results.csv and reports/threshold_results.csv.
 """
 
 import json
@@ -16,6 +17,7 @@ from sklearn.model_selection import train_test_split
 from src.config import (
     MODEL_PATH,
     METADATA_PATH,
+    REPORTS_DIR,
     VAL_SPLIT_RATIO,
     LIGHTGBM_CONFIG,
     THRESHOLDS_GRID,
@@ -26,6 +28,9 @@ from src.features import extract_features_for_candidates, FEATURE_NAMES
 from src.hard_negatives import sample_hard_negatives
 from src.evaluate import evaluate_predictions
 from src.utils import logger, time_block, evaluate_macro_f05
+
+VALIDATION_RESULTS_CSV = REPORTS_DIR / "validation_results.csv"
+THRESHOLD_RESULTS_CSV = REPORTS_DIR / "threshold_results.csv"
 
 
 def create_labeled_dataset(
@@ -69,10 +74,10 @@ def find_optimal_threshold(
     val_probs: np.ndarray,
     ground_truth_dict: Dict[str, Set[str]],
     thresholds: List[float] = THRESHOLDS_GRID
-) -> Tuple[float, float, float, Dict[float, float]]:
+) -> Tuple[float, float, float, Dict[float, float], List[Dict[str, Any]]]:
     """
     Grid search decision threshold and probability margin to maximize validation Macro F0.5.
-    Penalizes false positives on singletons heavily.
+    Exports reports/threshold_results.csv.
     """
     logger.info("Optimizing threshold & margin for Macro F0.5...")
 
@@ -87,6 +92,7 @@ def find_optimal_threshold(
     best_margin = 0.05
     best_macro_f05 = -1.0
     thresh_scores = {}
+    threshold_records = []
 
     margin_candidates = [0.0, 0.02, 0.05, 0.08, 0.10]
 
@@ -116,6 +122,16 @@ def find_optimal_threshold(
                 s1_ids=val_s1_ids
             )
             score = eval_res["macro_f05"]
+            
+            threshold_records.append({
+                "threshold": thresh,
+                "margin": margin,
+                "macro_f05": score,
+                "precision": eval_res["macro_precision"],
+                "recall": eval_res["macro_recall"],
+                "singleton_accuracy": eval_res["singleton_accuracy"],
+            })
+
             if margin == 0.05:
                 thresh_scores[thresh] = score
 
@@ -124,8 +140,12 @@ def find_optimal_threshold(
                 best_thresh = thresh
                 best_margin = margin
 
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(threshold_records).to_csv(THRESHOLD_RESULTS_CSV, index=False)
+    logger.info(f"Saved threshold grid search results to {THRESHOLD_RESULTS_CSV}")
+
     logger.info(f"★ OPTIMAL THRESHOLD FOUND: threshold={best_thresh:.2f}, margin={best_margin:.2f} -> Validation Macro F0.5 = {best_macro_f05:.4f}")
-    return best_thresh, best_margin, best_macro_f05, thresh_scores
+    return best_thresh, best_margin, best_macro_f05, thresh_scores, threshold_records
 
 
 @time_block("LightGBM Model Training Pipeline")
@@ -138,6 +158,7 @@ def train_matcher_model(
 ) -> Tuple[Any, float, float, Dict[str, Any]]:
     """
     Train LightGBM binary matcher, tune threshold/margin on validation split, and save model & metadata.
+    Exports reports/validation_results.csv.
     """
     all_s1_ids = list(s1_preprocessed["entity_id"].unique())
     train_s1_ids, val_s1_ids = train_test_split(
@@ -186,7 +207,7 @@ def train_matcher_model(
 
     val_probs = model.predict_proba(X_val)[:, 1] if len(X_val) > 0 else np.zeros(0)
 
-    best_thresh, best_margin, best_macro_f05, thresh_scores = find_optimal_threshold(
+    best_thresh, best_margin, best_macro_f05, thresh_scores, threshold_records = find_optimal_threshold(
         val_s1_ids=val_s1_ids,
         val_pair_ids=val_pair_ids,
         val_probs=val_probs,
@@ -219,6 +240,19 @@ def train_matcher_model(
         s1_metadata_df=s1_preprocessed,
         s1_ids=val_s1_ids
     )
+
+    # Save reports/validation_results.csv
+    val_res_df = pd.DataFrame([{
+        "macro_f05": val_eval.get("macro_f05", 0.0),
+        "macro_precision": val_eval.get("macro_precision", 0.0),
+        "macro_recall": val_eval.get("macro_recall", 0.0),
+        "singleton_accuracy": val_eval.get("singleton_accuracy", 0.0),
+        "best_threshold": best_thresh,
+        "best_margin": best_margin,
+        "total_evaluated_s1": len(val_s1_ids),
+    }])
+    val_res_df.to_csv(VALIDATION_RESULTS_CSV, index=False)
+    logger.info(f"Saved validation metrics summary to {VALIDATION_RESULTS_CSV}")
 
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, MODEL_PATH)

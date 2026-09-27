@@ -1,6 +1,7 @@
 """
 Data loading, ingestion, and preprocessing pipeline for TSV datasets.
 Includes automatic quality inspection, schema validation, and missing value checks.
+Ensures sample mode loads all ground truth target entities for aligned validation evaluation.
 """
 
 from pathlib import Path
@@ -141,14 +142,13 @@ def preprocess_source_df(df: pd.DataFrame) -> pd.DataFrame:
 def load_train_data(nrows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Load all training datasets and ground truth.
-    Supports both sample mode (for dev) and full mode (for complete execution).
+    Supports both sample mode (aligned target pool for accurate recall evaluation) and full mode.
     """
     logger.info(f"Loading training data (nrows={nrows or 'FULL'})...")
     s1_df = load_raw_tsv(TRAIN_SOURCE1_PATH, nrows=nrows)
     inspect_dataset(s1_df, "Train Source 1")
 
     if nrows is not None:
-        # Aligned sample loading for fast development
         s1_id_set = set(s1_df["entity_id"])
         target_ids = set()
         aligned_gt_rows = []
@@ -167,9 +167,18 @@ def load_train_data(nrows: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataF
 
         gt_df = pd.DataFrame(aligned_gt_rows, columns=["source1_entity_id", "matched_entity_ids"])
         
-        # Load sample S2 and S3 containing all target matches plus distractors
-        s2_df = load_raw_tsv(TRAIN_SOURCE2_PATH, nrows=nrows * 3)
-        s3_df = load_raw_tsv(TRAIN_SOURCE3_PATH, nrows=nrows * 3)
+        # Load S2 and S3 containing all true targets + background sample
+        s2_full = load_raw_tsv(TRAIN_SOURCE2_PATH)
+        s3_full = load_raw_tsv(TRAIN_SOURCE3_PATH)
+
+        s2_true = s2_full[s2_full["entity_id"].isin(target_ids)]
+        s3_true = s3_full[s3_full["entity_id"].isin(target_ids)]
+
+        s2_bg = s2_full[~s2_full["entity_id"].isin(target_ids)].iloc[:nrows * 2]
+        s3_bg = s3_full[~s3_full["entity_id"].isin(target_ids)].iloc[:nrows * 2]
+
+        s2_df = pd.concat([s2_true, s2_bg], ignore_index=True).drop_duplicates(subset=["entity_id"])
+        s3_df = pd.concat([s3_true, s3_bg], ignore_index=True).drop_duplicates(subset=["entity_id"])
     else:
         gt_df = load_raw_tsv(TRAIN_GROUND_TRUTH_PATH)
         s2_df = load_raw_tsv(TRAIN_SOURCE2_PATH)

@@ -17,8 +17,7 @@ from src.config import (
     OUTPUT_CANDIDATES_PATH,
     TEST_DIR,
     METADATA_PATH,
-    BLOCKING_REPORT_PATH,
-    VALIDATION_REPORT_PATH,
+    REPORTS_DIR,
 )
 from src.data_loader import load_train_data, preprocess_source_df
 from src.candidate_generation import generate_candidates_for_dataset, evaluate_blocking_recall
@@ -26,6 +25,9 @@ from src.train_model import train_matcher_model
 from src.predict import run_predict_pipeline
 from src.eda import run_eda
 from src.utils import parse_ground_truth_file, logger, time_block
+
+BLOCKING_REPORT_CSV = REPORTS_DIR / "blocking_report.csv"
+VALIDATION_RESULTS_CSV = REPORTS_DIR / "validation_results.csv"
 
 
 def run_official_validator() -> bool:
@@ -84,7 +86,6 @@ def main():
     )
     args = parser.parse_args()
 
-    # Determine nrows based on mode
     nrows = None if args.mode == "full" else args.sample_size
 
     logger.info("=" * 60)
@@ -145,29 +146,46 @@ def main():
     if args.stage in ["all", "validate"]:
         logger.info("\n>>> STAGE 6: OFFICIAL SUBMISSION FORMAT VALIDATION")
         is_valid = run_official_validator()
-        
-        # Load final metadata summary
-        val_macro_f05 = "N/A"
+
+        # Load metrics dynamically from generated reports
+        macro_f05 = "N/A"
         best_thresh = "N/A"
-        if METADATA_PATH.exists():
-            with open(METADATA_PATH, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-                val_macro_f05 = f"{meta.get('validation_macro_f05', 0.0):.4f}"
-                best_thresh = f"{meta.get('optimal_threshold', 0.0):.2f}"
+        cand_recall = "N/A"
+        entity_complete_rec = "N/A"
+        avg_cands = "N/A"
+        p95_cands = "N/A"
+        reduction_ratio = "N/A"
+        singleton_acc = "N/A"
+
+        if BLOCKING_REPORT_CSV.exists():
+            b_df = pd.read_csv(BLOCKING_REPORT_CSV)
+            if not b_df.empty:
+                r = b_df.iloc[0]
+                cand_recall = f"{r.get('pair_candidate_recall', 0.0):.4f}"
+                entity_complete_rec = f"{r.get('entity_complete_recall', 0.0):.4f}"
+                avg_cands = f"{r.get('mean_candidates_per_s1', 0.0):.2f}"
+                p95_cands = f"{r.get('p95_candidates_per_s1', 0.0):.1f}"
+                reduction_ratio = f"{r.get('candidate_reduction_ratio', 0.0):.8f}"
+
+        if VALIDATION_RESULTS_CSV.exists():
+            v_df = pd.read_csv(VALIDATION_RESULTS_CSV)
+            if not v_df.empty:
+                vr = v_df.iloc[0]
+                macro_f05 = f"{vr.get('macro_f05', 0.0):.4f}"
+                best_thresh = f"{vr.get('best_threshold', 0.0):.2f}"
+                singleton_acc = f"{vr.get('singleton_accuracy', 0.0):.4f}"
 
         print("\n" + "=" * 60)
         print("FINAL PIPELINE SUMMARY")
         print("=" * 60)
-        print(f"Validation Macro F0.5:         {val_macro_f05}")
+        print(f"Validation Macro F0.5:         {macro_f05}")
         print(f"Best threshold:               {best_thresh}")
-        print(f"Candidate recall:             0.9420")
-        print(f"Entity-complete recall:        0.9150")
-        print(f"Average candidates/S1:        14.85")
-        print(f"P95 candidates/S1:            23.0")
-        print(f"Candidate reduction ratio:    0.99999851")
-        print(f"Singleton accuracy:           0.9850")
-        print(f"Predicted matched entities:   1,632,500")
-        print(f"Predicted singleton entities: 100,044")
+        print(f"Candidate recall:             {cand_recall}")
+        print(f"Entity-complete recall:        {entity_complete_rec}")
+        print(f"Average candidates/S1:        {avg_cands}")
+        print(f"P95 candidates/S1:            {p95_cands}")
+        print(f"Candidate reduction ratio:    {reduction_ratio}")
+        print(f"Singleton accuracy:           {singleton_acc}")
         print("\nOfficial validator:")
         print("PASS" if is_valid else "FAIL")
         print("=" * 60 + "\n")

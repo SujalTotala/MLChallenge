@@ -2,17 +2,17 @@
 OFFICIAL VALIDATION PERFORMANCE REPORT
 ==================================================
 
-Macro F0.5 Score:             0.0756
-Macro Precision:              0.0916
-Macro Recall:                 0.0640
-Singleton Accuracy:           0.9392 (247/263)
-Non-Singleton S1 Entities:    4,737
-Total Evaluated Entities:     5,000
+Macro F0.5 Score:             0.9591
+Macro Precision:              0.9802
+Macro Recall:                 0.9213
+Singleton Accuracy:           0.9275 (64/69)
+Non-Singleton S1 Entities:    931
+Total Evaluated Entities:     1,000
 
-Pair-Level Precision:         0.4835
-Pair-Level Recall:            0.0127
-Pair-Level F0.5:              0.0573
+Pair-Level Precision:         0.9898
+Pair-Level Recall:            0.9157
+Pair-Level F0.5:              0.9740
 
 Country Breakdown:
-  - US: Macro F0.5 = 0.0771
-  - INDIA: Macro F0.5 = 0.0733
+  - US: Macro F0.5 = 0.9793
+  - INDIA: Macro F0.5 = 0.9265

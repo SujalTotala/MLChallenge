@@ -1,0 +1,2 @@
+pair_candidate_recall,entity_complete_recall,mean_candidates_per_s1,median_candidates_per_s1,p95_candidates_per_s1,max_candidates_per_s1,zero_candidate_s1_count,total_true_links,recovered_links,missing_links,candidate_reduction_ratio
+0.9258725953231195,0.8078964126512418,24.5552,25.0,25.0,25,1,17362,16075,1287,0.99999754448

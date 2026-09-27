@@ -1,6 +1,6 @@
 """
 Candidate generation and blocking recall evaluation module.
-Generates candidate_pairs.tsv and blocking performance reports.
+Generates candidate_pairs.tsv and exports blocking_report.csv and candidate_recall_report.csv.
 """
 
 from collections import defaultdict
@@ -10,9 +10,12 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from src.config import TOP_K_CANDIDATES, OUTPUT_CANDIDATES_PATH, BLOCKING_REPORT_PATH
+from src.config import TOP_K_CANDIDATES, OUTPUT_CANDIDATES_PATH, REPORTS_DIR
 from src.blocking import MultiChannelBlockingEngine
 from src.utils import logger, time_block, save_submission_tsv, parse_id_list
+
+BLOCKING_REPORT_CSV = REPORTS_DIR / "blocking_report.csv"
+CANDIDATE_RECALL_CSV = REPORTS_DIR / "candidate_recall_report.csv"
 
 
 @time_block("Candidate Generation (Multi-Channel Blocking)")
@@ -50,15 +53,9 @@ def evaluate_blocking_recall(
     total_target_records: int = 10000000
 ) -> Dict[str, Any]:
     """
-    Evaluate blocking metrics against ground truth and write reports/blocking_report.txt:
-    - pair candidate recall
-    - entity-complete candidate recall
-    - average candidates per S1
-    - median candidates per S1
-    - P95 candidates per S1
-    - maximum candidates per S1
-    - candidate reduction ratio
-    - recall breakdown by country, multiple matches, and singletons.
+    Evaluate blocking metrics against ground truth and write:
+    - reports/blocking_report.csv
+    - reports/candidate_recall_report.csv
     """
     logger.info("Evaluating multi-channel candidate blocking recall...")
 
@@ -67,10 +64,10 @@ def evaluate_blocking_recall(
     s1_with_all_recovered = 0
     total_s1_with_matches = 0
     singletons_count = 0
+    zero_candidate_s1_count = 0
 
     candidate_counts = []
-    
-    # Country-level tracking
+
     s1_country_map = {}
     if s1_preprocessed is not None and "country" in s1_preprocessed.columns:
         s1_country_map = dict(zip(s1_preprocessed["entity_id"], s1_preprocessed["country"]))
@@ -78,28 +75,48 @@ def evaluate_blocking_recall(
     country_true = defaultdict(int)
     country_recovered = defaultdict(int)
 
+    recall_rows = []
+
     for _, row in ground_truth_df.iterrows():
         s1_id = str(row["source1_entity_id"]).strip()
         true_matches = parse_id_list(row.get("matched_entity_ids"))
         cands_info = candidates_dict.get(s1_id, [])
         cand_ids = {c[0] for c in cands_info}
-        
-        candidate_counts.append(len(cand_ids))
+
+        cand_len = len(cand_ids)
+        candidate_counts.append(cand_len)
+        if cand_len == 0:
+            zero_candidate_s1_count += 1
+
         country = s1_country_map.get(s1_id, "unknown")
 
         if len(true_matches) == 0:
             singletons_count += 1
+            is_complete = True
+            rec_count = 0
         else:
             total_s1_with_matches += 1
             total_true_matches += len(true_matches)
             country_true[country] += len(true_matches)
 
             overlap = true_matches & cand_ids
-            recovered_matches += len(overlap)
-            country_recovered[country] += len(overlap)
+            rec_count = len(overlap)
+            recovered_matches += rec_count
+            country_recovered[country] += rec_count
 
-            if overlap == true_matches:
+            is_complete = (overlap == true_matches)
+            if is_complete:
                 s1_with_all_recovered += 1
+
+        recall_rows.append({
+            "source1_entity_id": s1_id,
+            "country": country,
+            "true_match_count": len(true_matches),
+            "candidate_count": cand_len,
+            "recovered_match_count": rec_count,
+            "missing_match_count": max(0, len(true_matches) - rec_count),
+            "entity_complete": is_complete
+        })
 
     pair_recall = (recovered_matches / total_true_matches) if total_true_matches > 0 else 0.0
     entity_complete_recall = (s1_with_all_recovered / total_s1_with_matches) if total_s1_with_matches > 0 else 0.0
@@ -109,7 +126,6 @@ def evaluate_blocking_recall(
     p95_cands = float(np.percentile(candidate_counts, 95)) if candidate_counts else 0.0
     max_cands = int(max(candidate_counts)) if candidate_counts else 0
 
-    # Reduction ratio: 1 - (total candidates evaluated / (N_s1 * N_targets))
     total_candidates_generated = sum(candidate_counts)
     total_possible_pairs = max(1, len(candidate_counts) * total_target_records)
     reduction_ratio = 1.0 - (total_candidates_generated / total_possible_pairs)
@@ -132,11 +148,12 @@ def evaluate_blocking_recall(
         "country_recall": country_recall,
         "total_true_links": total_true_matches,
         "recovered_links": recovered_matches,
+        "missing_links": total_true_matches - recovered_matches,
+        "zero_candidate_s1_count": zero_candidate_s1_count,
         "singletons_count": singletons_count,
         "non_singletons_count": total_s1_with_matches,
     }
 
-    # Print summary
     logger.info("=" * 60)
     logger.info("BLOCKING EVALUATION REPORT")
     logger.info("=" * 60)
@@ -145,33 +162,31 @@ def evaluate_blocking_recall(
     logger.info(f"  Average Candidates per S1:         {mean_cands:.2f}")
     logger.info(f"  Median Candidates per S1:          {median_cands:.1f}")
     logger.info(f"  P95 Candidates per S1:             {p95_cands:.1f}")
-    logger.info(f"  Max Candidates per S1:             {max_cands}")
+    logger.info(f"  Zero Candidate S1 Entities:        {zero_candidate_s1_count:,}")
     logger.info(f"  Candidate Reduction Ratio:         {reduction_ratio:.8f}")
-    if country_recall:
-        logger.info("  Recall by Country:")
-        for cntry, rec in country_recall.items():
-            logger.info(f"    - {cntry.upper()}: Recall = {rec:.4f}")
     logger.info("=" * 60)
 
-    # Write reports/blocking_report.txt
-    BLOCKING_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(BLOCKING_REPORT_PATH, "w", encoding="utf-8") as f:
-        f.write("==================================================\n")
-        f.write("OFFICIAL BLOCKING & CANDIDATE GENERATION REPORT\n")
-        f.write("==================================================\n\n")
-        f.write(f"Raw Candidate Count:          {total_candidates_generated:,}\n")
-        f.write(f"Final Candidate Count:        {total_candidates_generated:,}\n")
-        f.write(f"Average Candidates/S1:        {mean_cands:.2f}\n")
-        f.write(f"Median Candidates/S1:         {median_cands:.1f}\n")
-        f.write(f"P95 Candidates/S1:            {p95_cands:.1f}\n")
-        f.write(f"Max Candidates/S1:            {max_cands}\n")
-        f.write(f"Pair Candidate Recall:        {pair_recall:.4f}\n")
-        f.write(f"Entity-Complete Recall:       {entity_complete_recall:.4f}\n")
-        f.write(f"Candidate Reduction Ratio:    {reduction_ratio:.8f}\n\n")
-        f.write("Country Breakdown:\n")
-        for cntry, rec in country_recall.items():
-            f.write(f"  - {cntry.upper()}: Recall = {rec:.4f}\n")
-    logger.info(f"Saved blocking report to {BLOCKING_REPORT_PATH}")
+    # Save reports/blocking_report.csv
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    summary_df = pd.DataFrame([{
+        "pair_candidate_recall": pair_recall,
+        "entity_complete_recall": entity_complete_recall,
+        "mean_candidates_per_s1": mean_cands,
+        "median_candidates_per_s1": median_cands,
+        "p95_candidates_per_s1": p95_cands,
+        "max_candidates_per_s1": max_cands,
+        "zero_candidate_s1_count": zero_candidate_s1_count,
+        "total_true_links": total_true_matches,
+        "recovered_links": recovered_matches,
+        "missing_links": total_true_matches - recovered_matches,
+        "candidate_reduction_ratio": reduction_ratio,
+    }])
+    summary_df.to_csv(BLOCKING_REPORT_CSV, index=False)
+    logger.info(f"Saved summary report to {BLOCKING_REPORT_CSV}")
+
+    # Save reports/candidate_recall_report.csv
+    pd.DataFrame(recall_rows).to_csv(CANDIDATE_RECALL_CSV, index=False)
+    logger.info(f"Saved candidate recall details to {CANDIDATE_RECALL_CSV}")
 
     return stats
 
