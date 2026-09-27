@@ -43,7 +43,7 @@ LEGAL_SUFFIX_PATTERNS = [
 
 COMPILED_LEGAL_SUFFIXES = [re.compile(p, re.IGNORECASE) for p in LEGAL_SUFFIX_PATTERNS]
 
-# Address token standardizations
+# Address token standardizations & alias mapping
 ADDRESS_REPLACEMENTS = {
     " street ": " st ",
     " road ": " rd ",
@@ -62,6 +62,26 @@ ADDRESS_REPLACEMENTS = {
     " sector ": " sec ",
     " near ": " nr ",
     " opposite ": " opp ",
+    " calcutta ": " kolkata ",
+    " bombay ": " mumbai ",
+    " madras ": " chennai ",
+    " bangalore ": " bengaluru ",
+    " gurgaon ": " gurugram ",
+    " cochin ": " kochi ",
+    " trivandrum ": " thiruvananthapuram ",
+    " baroda ": " vadodara ",
+    " poona ": " pune ",
+    " pondicherry ": " puducherry ",
+    " orissa ": " odisha ",
+    " calicut ": " kozhikode ",
+    " benares ": " varanasi ",
+    " banaras ": " varanasi ",
+    " allahabad ": " prayagraj ",
+    " mysore ": " mysuru ",
+    " mangalore ": " mangaluru ",
+    " belgaum ": " belagavi ",
+    " hubli ": " hubballi ",
+    " secunderabad ": " hyderabad ",
 }
 
 

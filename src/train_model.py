@@ -154,9 +154,10 @@ def train_matcher_model(
         sample_weights = np.where(y_train == 1, pos_weight, 1.0)
         
         model = HistGradientBoostingClassifier(
-            max_iter=150,
-            max_depth=8,
-            min_samples_leaf=10,
+            max_iter=200,
+            max_depth=9,
+            min_samples_leaf=8,
+            l2_regularization=0.02,
             random_state=RANDOM_SEED,
             scoring="loss"
         )

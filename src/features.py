@@ -1,13 +1,25 @@
 """
-High-performance pairwise feature engineering using RapidFuzz.
+High-performance pairwise feature engineering using RapidFuzz and domain-specific geo/entity indicators.
+Optimized for high precision and Macro F0.5.
 """
 
-from typing import Dict, List, Tuple, Any
+import re
+from typing import Dict, List, Tuple, Any, Set
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, distance
 from tqdm import tqdm
 from src.utils import logger, time_block
+
+US_STATES = {
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id", "il", "in", "ia",
+    "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms", "mo", "mt", "ne", "nv", "nh", "nj",
+    "nm", "ny", "nc", "nd", "oh", "ok", "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt",
+    "va", "wa", "wv", "wi", "wy", "dc", "pr"
+}
+
+RE_PINCODE_IN = re.compile(r"\b[1-9][0-9]{5}\b")
+RE_ZIPCODE_US = re.compile(r"\b\d{5}\b")
 
 FEATURE_NAMES = [
     "name_exact_match",
@@ -20,21 +32,53 @@ FEATURE_NAMES = [
     "name_token_jaccard",
     "name_token_overlap_count",
     "name_token_containment",
+    "name_token_diff_count",
     "name_length_diff",
     "name_length_ratio",
+    "name_num_tokens",
+    "has_s1_addr",
+    "has_c_addr",
+    "both_have_addr",
+    "one_addr_missing",
     "address_exact_match",
     "address_levenshtein_ratio",
     "address_token_sort_ratio",
     "address_token_set_ratio",
     "address_token_jaccard",
+    "address_containment",
     "address_numbers_exact",
     "address_numbers_jaccard",
     "address_numbers_overlap_count",
+    "number_conflict",
+    "pincode_match",
+    "pincode_conflict",
+    "zipcode_match",
+    "zipcode_conflict",
+    "state_match",
+    "state_conflict",
+    "name_x_addr_sim",
+    "name_jw_x_addr_jaccard",
     "country_exact_match",
     "is_s2",
     "blocking_score",
     "blocking_rank",
 ]
+
+
+def extract_geo_markers(addr_norm: str, tokens: List[str], country: str) -> Tuple[Set[str], Set[str], Set[str]]:
+    """Extract Indian 6-digit pincodes, US 5-digit zip codes, and US state 2-letter abbreviations."""
+    pincodes = []
+    zipcodes = []
+    states = []
+    
+    if country == "india" and addr_norm:
+        pincodes = RE_PINCODE_IN.findall(addr_norm)
+    elif country == "us" and addr_norm:
+        zipcodes = RE_ZIPCODE_US.findall(addr_norm)
+        for t in tokens:
+            if t in US_STATES:
+                states.append(t)
+    return set(pincodes), set(zipcodes), set(states)
 
 
 def compute_pair_features(
@@ -44,9 +88,10 @@ def compute_pair_features(
     blocking_rank: int = 0
 ) -> List[float]:
     """
-    Compute pairwise similarity features between one S1 record and one Candidate record.
+    Compute 40-dimensional pairwise similarity features between one S1 record and one Candidate record.
+    Includes precision-critical geo-conflict and address discrepancy indicators.
     """
-    # Name features
+    # 1. Name features
     s1_name = s1_dict.get("name_norm", "")
     c_name = cand_dict.get("name_norm", "")
     
@@ -74,12 +119,14 @@ def compute_pair_features(
     name_overlap = float(tok_inter)
     min_len = min(len(s1_tokens), len(c_tokens))
     name_containment = (tok_inter / min_len) if min_len > 0 else 0.0
+    tok_diff_count = float(len(s1_tokens ^ c_tokens))
 
     len1, len2 = len(s1_name), len(c_name)
     name_len_diff = float(abs(len1 - len2))
     name_len_ratio = (min(len1, len2) / max(1, max(len1, len2))) if (len1 or len2) else 0.0
+    name_num_tokens = float(len(s1_tokens))
 
-    # Address features
+    # 2. Address features
     s1_addr = s1_dict.get("address_norm", "")
     c_addr = cand_dict.get("address_norm", "")
 
@@ -89,6 +136,11 @@ def compute_pair_features(
     s1_nums = set(s1_dict.get("address_numbers", []))
     c_nums = set(cand_dict.get("address_numbers", []))
 
+    has_s1_addr = 1.0 if s1_addr else 0.0
+    has_c_addr = 1.0 if c_addr else 0.0
+    both_have_addr = 1.0 if (s1_addr and c_addr) else 0.0
+    one_addr_missing = 1.0 if ((s1_addr and not c_addr) or (not s1_addr and c_addr)) else 0.0
+
     addr_exact = 1.0 if (s1_addr and s1_addr == c_addr) else 0.0
     addr_lev = fuzz.ratio(s1_addr, c_addr) / 100.0 if s1_addr and c_addr else 0.0
     addr_tsort = fuzz.token_sort_ratio(s1_addr, c_addr) / 100.0 if s1_addr and c_addr else 0.0
@@ -97,6 +149,7 @@ def compute_pair_features(
     addr_inter = len(s1_addr_tokens & c_addr_tokens)
     addr_union = len(s1_addr_tokens | c_addr_tokens)
     addr_jaccard = (addr_inter / addr_union) if addr_union > 0 else 0.0
+    addr_containment = (addr_inter / min(len(s1_addr_tokens), len(c_addr_tokens))) if (s1_addr_tokens and c_addr_tokens) else 0.0
 
     nums_inter = len(s1_nums & c_nums)
     nums_union = len(s1_nums | c_nums)
@@ -104,7 +157,28 @@ def compute_pair_features(
     nums_jaccard = (nums_inter / nums_union) if nums_union > 0 else 0.0
     nums_overlap = float(nums_inter)
 
-    # Country & Metadata
+    # Number conflict: both have numbers, but set intersection is empty (different street numbers)
+    number_conflict = 1.0 if (len(s1_nums) > 0 and len(c_nums) > 0 and nums_inter == 0) else 0.0
+
+    # 3. Geo Markers & Conflict Detection
+    country = s1_dict.get("country", "")
+    s1_pins, s1_zips, s1_states = extract_geo_markers(s1_addr, s1_dict.get("address_tokens", []), country)
+    c_pins, c_zips, c_states = extract_geo_markers(c_addr, cand_dict.get("address_tokens", []), country)
+
+    pincode_match = 1.0 if (s1_pins and c_pins and (s1_pins & c_pins)) else 0.0
+    pincode_conflict = 1.0 if (s1_pins and c_pins and not (s1_pins & c_pins)) else 0.0
+
+    zipcode_match = 1.0 if (s1_zips and c_zips and (s1_zips & c_zips)) else 0.0
+    zipcode_conflict = 1.0 if (s1_zips and c_zips and not (s1_zips & c_zips)) else 0.0
+
+    state_match = 1.0 if (s1_states and c_states and (s1_states & c_states)) else 0.0
+    state_conflict = 1.0 if (s1_states and c_states and not (s1_states & c_states)) else 0.0
+
+    # 4. Non-linear Interaction Features
+    name_x_addr = name_lev * addr_lev if both_have_addr else name_lev * 0.5
+    name_jw_x_addr_jaccard = name_jw * addr_jaccard if both_have_addr else 0.0
+
+    # 5. Metadata
     s1_cntry = s1_dict.get("country", "")
     c_cntry = cand_dict.get("country", "")
     country_match = 1.0 if (s1_cntry and s1_cntry == c_cntry) else 0.0
@@ -123,16 +197,32 @@ def compute_pair_features(
         name_jaccard,
         name_overlap,
         name_containment,
+        tok_diff_count,
         name_len_diff,
         name_len_ratio,
+        name_num_tokens,
+        has_s1_addr,
+        has_c_addr,
+        both_have_addr,
+        one_addr_missing,
         addr_exact,
         addr_lev,
         addr_tsort,
         addr_tset,
         addr_jaccard,
+        addr_containment,
         nums_exact,
         nums_jaccard,
         nums_overlap,
+        number_conflict,
+        pincode_match,
+        pincode_conflict,
+        zipcode_match,
+        zipcode_conflict,
+        state_match,
+        state_conflict,
+        name_x_addr,
+        name_jw_x_addr_jaccard,
         country_match,
         is_s2,
         float(blocking_score),
@@ -149,7 +239,6 @@ def extract_features_for_candidates(
     """
     Extract pairwise feature matrix X and corresponding pair IDs (s1_id, candidate_id).
     """
-    # Create fast dictionary lookups by entity_id
     logger.info("Indexing preprocessed records for fast pairwise feature extraction...")
     s1_map = {row.entity_id: row._asdict() for row in s1_preprocessed.itertuples(index=False)}
     targets_map = {row.entity_id: row._asdict() for row in targets_preprocessed.itertuples(index=False)}
