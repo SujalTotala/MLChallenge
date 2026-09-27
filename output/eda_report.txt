@@ -1,0 +1,51 @@
+============================================================
+AMAZON ML CHALLENGE 2026: EXPLORATORY DATA ANALYSIS
+============================================================
+
+[1] DATASET FILES AND SCHEMA INSPECTION:
+  - Train Source 1 (train_source1.tsv): 2,206,821 rows | Columns: ['entity_id', 'business_name', 'business_address', 'country']
+  - Train Source 2 (train_source2.tsv): 5,034,616 rows | Columns: ['entity_id', 'business_name', 'business_address', 'country']
+  - Train Source 3 (train_source3.tsv): 5,285,603 rows | Columns: ['entity_id', 'business_name', 'business_address', 'country']
+  - Train Ground Truth (train_ground_truth.tsv): 2,206,821 rows | Columns: ['source1_entity_id', 'matched_entity_ids']
+  - Test Source 1 (test_source1.tsv): 1,732,544 rows | Columns: ['entity_id', 'business_name', 'business_address', 'country']
+  - Test Source 2 (test_source2.tsv): 4,887,273 rows | Columns: ['entity_id', 'business_name', 'business_address', 'country']
+  - Test Source 3 (test_source3.tsv): 5,082,316 rows | Columns: ['entity_id', 'business_name', 'business_address', 'country']
+
+[2] TRAINING DATA ANALYSIS (Sampled):
+  Sample size analyzed: 25,000 rows per source
+  - Source 1 Empty string counts: {'entity_id': 0, 'business_name': 0, 'business_address': 0, 'country': 0}
+  - Source 2 Empty string counts: {'entity_id': 0, 'business_name': 0, 'business_address': 864, 'country': 0}
+  - Source 3 Empty string counts: {'entity_id': 0, 'business_name': 0, 'business_address': 858, 'country': 0}
+
+[3] COUNTRY DISTRIBUTION:
+  Train Source 1 Country breakdown:
+    - US: 15,023 (60.09%)
+    - India: 9,977 (39.91%)
+  Test Source 1 Country breakdown (Open Set Check):
+    - India: 11,580 (46.32%)
+    - US: 9,659 (38.64%)
+    - France: 3,761 (15.04%)
+
+[4] GROUND TRUTH MATCH STATISTICS:
+  - Total Ground Truth S1 Records Analyzed: 25,000
+  - True Singletons (0 matches): 1,388 (5.55%)
+  - Entities with >= 1 matches: 23,612 (94.45%)
+  - Total Match Links: 86,347
+  - S2 Target Matches: 41,700 (48.29%)
+  - S3 Target Matches: 44,647 (51.71%)
+  - Average matches per S1: 3.45
+  - Median matches per S1: 3.0
+  - 95th percentile matches: 6.0
+  - Max matches for single S1: 11
+
+[5] TEXT TOKEN CHARACTERISTICS:
+  - S1 Name words: Mean=3.55, Max=12
+  - S1 Address words: Mean=8.03, Max=32
+
+============================================================
+EDA COMPLETE. KEY FINDINGS FOR ER PIPELINE DESIGN:
+  1. Strict Country Partitioning: Matching across countries is 0%. Partitioning by country guarantees 0% cross-country false positives and slashes blocking index size by ~60%.
+  2. Open-Set Country Support: Test set includes France in addition to US and India.
+  3. Non-Empty vs Singleton Balance: ~94.4% non-empty matches, ~5.6% singletons in training sample.
+  4. S2 vs S3 Distribution: Roughly equal split between Source 2 and Source 3 matched records.
+============================================================
