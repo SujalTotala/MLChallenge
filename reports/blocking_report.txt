@@ -1,0 +1,17 @@
+==================================================
+OFFICIAL BLOCKING & CANDIDATE GENERATION REPORT
+==================================================
+
+Raw Candidate Count:          593,372
+Final Candidate Count:        593,372
+Average Candidates/S1:        23.73
+Median Candidates/S1:         25.0
+P95 Candidates/S1:            25.0
+Max Candidates/S1:            25
+Pair Candidate Recall:        0.0133
+Entity-Complete Recall:       0.0010
+Candidate Reduction Ratio:    0.99999763
+
+Country Breakdown:
+  - INDIA: Recall = 0.0125
+  - US: Recall = 0.0139

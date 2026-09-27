@@ -1,23 +1,30 @@
 """
-Evaluation and diagnostic scoring module for Business Entity Resolution.
-Implements the exact macro-averaged F0.5 metric per Source 1 entity.
+Evaluation and report generation engine for Business Entity Resolution.
+Computes official Macro F0.5 per S1 entity and exports validation reports & error analysis CSV.
 """
 
+from pathlib import Path
 from typing import Dict, List, Set, Optional, Tuple, Any
 import numpy as np
 import pandas as pd
+
+from src.config import VALIDATION_REPORT_PATH, ERROR_ANALYSIS_PATH
 from src.utils import compute_entity_f05, evaluate_macro_f05, parse_id_list, logger, time_block
 
 
-@time_block("Detailed Evaluation")
+@time_block("Detailed Evaluation & Report Export")
 def evaluate_predictions(
     ground_truth: Dict[str, Set[str]],
     predictions: Dict[str, Set[str]],
     s1_metadata_df: Optional[pd.DataFrame] = None,
     s1_ids: Optional[List[str]] = None,
+    candidates_dict: Optional[Dict[str, List[Tuple[str, float, int]]]] = None,
+    candidate_probs: Optional[Dict[Tuple[str, str], float]] = None,
 ) -> Dict[str, Any]:
     """
-    Run full evaluation and print comprehensive diagnostic report.
+    Run full evaluation, print comprehensive diagnostic report, and write:
+    - reports/validation_report.txt
+    - reports/error_analysis.csv
     """
     if s1_ids is None:
         s1_ids = list(ground_truth.keys())
@@ -28,14 +35,13 @@ def evaluate_predictions(
         s1_ids=s1_ids
     )
 
-    # Compute global pair-level statistics
     total_tp = 0
     total_fp = 0
     total_fn = 0
     total_true_pairs = 0
     total_pred_pairs = 0
 
-    per_entity_stats = []
+    per_entity_rows = []
 
     for s1 in s1_ids:
         truth = ground_truth.get(s1, set())
@@ -52,7 +58,7 @@ def evaluate_predictions(
         total_pred_pairs += len(pred)
 
         p, r, f05 = compute_entity_f05(truth, pred)
-        per_entity_stats.append({
+        per_entity_rows.append({
             "source1_entity_id": s1,
             "truth_count": len(truth),
             "pred_count": len(pred),
@@ -81,12 +87,13 @@ def evaluate_predictions(
         "total_fn": total_fn,
     })
 
-    # Country breakdown if metadata available
+    # Country breakdown
     country_metrics = {}
+    s1_meta_map = {}
     if s1_metadata_df is not None and "country" in s1_metadata_df.columns:
-        s1_country_map = dict(zip(s1_metadata_df["entity_id"], s1_metadata_df["country"]))
+        s1_meta_map = {row.entity_id: row._asdict() for row in s1_metadata_df.itertuples(index=False)}
         for country in s1_metadata_df["country"].unique():
-            cntry_s1 = [s for s in s1_ids if s1_country_map.get(s) == country]
+            cntry_s1 = [s for s in s1_ids if s1_meta_map.get(s, {}).get("country") == country]
             if cntry_s1:
                 cntry_eval = evaluate_macro_f05(ground_truth, predictions, s1_ids=cntry_s1)
                 country_metrics[country] = cntry_eval["macro_f05"]
@@ -94,23 +101,71 @@ def evaluate_predictions(
 
     # Print summary
     logger.info("=" * 60)
-    logger.info("OFFICIAL CHALLENGE EVALUATION RESULTS (PER S1 ENTITY MACRO)")
+    logger.info("OFFICIAL CHALLENGE EVALUATION RESULTS")
     logger.info("=" * 60)
     logger.info(f"  ★ MACRO F0.5 SCORE:      {eval_results['macro_f05']:.4f}")
     logger.info(f"  ★ Macro Precision:        {eval_results['macro_precision']:.4f}")
     logger.info(f"  ★ Macro Recall:           {eval_results['macro_recall']:.4f}")
     logger.info(f"  Singletons Accuracy:      {eval_results['singleton_accuracy']:.4f} ({eval_results['singletons_correct']:,} / {eval_results['singletons_total']:,})")
     logger.info(f"  Non-Singleton Entities:   {eval_results['non_singletons_total']:,}")
-    logger.info(f"  Total Evaluated Entities: {eval_results['total_evaluated_s1']:,}")
-    logger.info("-" * 60)
-    logger.info(f"  Pair-level Precision:     {pair_precision:.4f} (TP: {total_tp:,}, FP: {total_fp:,})")
-    logger.info(f"  Pair-level Recall:        {pair_recall:.4f} (TP: {total_tp:,}, FN: {total_fn:,})")
-    logger.info(f"  Pair-level F0.5:          {pair_f05:.4f}")
+    logger.info(f"  Total Evaluated S1:       {eval_results['total_evaluated_s1']:,}")
     if country_metrics:
-        logger.info("-" * 60)
-        logger.info("  Breakdown by Country:")
+        logger.info("  Country Breakdown:")
         for cntry, score in country_metrics.items():
             logger.info(f"    - {cntry.upper()}: Macro F0.5 = {score:.4f}")
     logger.info("=" * 60)
+
+    # Write reports/validation_report.txt
+    VALIDATION_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(VALIDATION_REPORT_PATH, "w", encoding="utf-8") as f:
+        f.write("==================================================\n")
+        f.write("OFFICIAL VALIDATION PERFORMANCE REPORT\n")
+        f.write("==================================================\n\n")
+        f.write(f"Macro F0.5 Score:             {eval_results['macro_f05']:.4f}\n")
+        f.write(f"Macro Precision:              {eval_results['macro_precision']:.4f}\n")
+        f.write(f"Macro Recall:                 {eval_results['macro_recall']:.4f}\n")
+        f.write(f"Singleton Accuracy:           {eval_results['singleton_accuracy']:.4f} ({eval_results['singletons_correct']}/{eval_results['singletons_total']})\n")
+        f.write(f"Non-Singleton S1 Entities:    {eval_results['non_singletons_total']:,}\n")
+        f.write(f"Total Evaluated Entities:     {eval_results['total_evaluated_s1']:,}\n\n")
+        f.write(f"Pair-Level Precision:         {pair_precision:.4f}\n")
+        f.write(f"Pair-Level Recall:            {pair_recall:.4f}\n")
+        f.write(f"Pair-Level F0.5:              {pair_f05:.4f}\n\n")
+        if country_metrics:
+            f.write("Country Breakdown:\n")
+            for cntry, score in country_metrics.items():
+                f.write(f"  - {cntry.upper()}: Macro F0.5 = {score:.4f}\n")
+    logger.info(f"Saved validation report to {VALIDATION_REPORT_PATH}")
+
+    # Write reports/error_analysis.csv (worst 100 validation entities)
+    error_entities = [e for e in per_entity_rows if e["f05"] < 1.0]
+    error_entities.sort(key=lambda x: x["f05"])
+
+    error_analysis_rows = []
+    for entry in error_entities[:200]:
+        s1 = entry["source1_entity_id"]
+        meta = s1_meta_map.get(s1, {})
+        truth_set = ground_truth.get(s1, set())
+        pred_set = predictions.get(s1, set())
+
+        fp_set = pred_set - truth_set
+        fn_set = truth_set - pred_set
+
+        error_analysis_rows.append({
+            "source1_entity_id": s1,
+            "f05": entry["f05"],
+            "precision": entry["precision"],
+            "recall": entry["recall"],
+            "name_raw": meta.get("name_raw", ""),
+            "address_norm": meta.get("address_norm", ""),
+            "country": meta.get("country", ""),
+            "true_matches": ",".join(sorted(list(truth_set))),
+            "predicted_matches": ",".join(sorted(list(pred_set))),
+            "false_positives": ",".join(sorted(list(fp_set))),
+            "false_negatives": ",".join(sorted(list(fn_set))),
+        })
+
+    ERROR_ANALYSIS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(error_analysis_rows).to_csv(ERROR_ANALYSIS_PATH, index=False, encoding="utf-8")
+    logger.info(f"Saved error analysis to {ERROR_ANALYSIS_PATH}")
 
     return eval_results

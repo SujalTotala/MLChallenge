@@ -1,109 +1,17 @@
 """
-High-Recall Inverted Index and Multi-Strategy Blocking Engine.
+Multi-Channel Scalable Blocking Engine for Business Entity Resolution.
+Implements Channels A through K with Inverted Indexes and Vectorized Batch TF-IDF Nearest-Neighbor Retrieval.
 """
 
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Any, Optional
+import numpy as np
 import pandas as pd
-from src.config import BLOCKING_CONFIG
+from scipy.sparse import csr_matrix
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from src.config import BLOCKING_CONFIG, TOP_K_CANDIDATES
 from src.utils import logger, time_block
-
-
-class EntityIndex:
-    """
-    Multi-key inverted index for fast candidate retrieval within a country partition.
-    """
-    def __init__(self, target_df: pd.DataFrame):
-        self.exact_name_index = defaultdict(list)
-        self.alnum_name_index = defaultdict(list)
-        self.name_token_index = defaultdict(list)
-        self.addr_token_index = defaultdict(list)
-        self.addr_num_name_index = defaultdict(list)
-        self.name_prefix_index = defaultdict(list)
-        self.name_3gram_index = defaultdict(list)
-        
-        self.token_frequencies = defaultdict(int)
-        self.addr_token_frequencies = defaultdict(int)
-        self.total_records = len(target_df)
-
-        # Pre-extract native lists for fast index-based scoring (1000x faster than df.iloc / df.at)
-        self.entity_ids = target_df["entity_id"].tolist()
-        self.name_no_suffixes = target_df["name_no_suffix"].tolist()
-        self.name_alnums = target_df["name_alnum"].tolist() if "name_alnum" in target_df.columns else [""] * self.total_records
-        self.name_tokens = target_df["name_tokens"].tolist()
-        self.address_tokens = target_df["address_tokens"].tolist()
-        self.address_numbers = target_df["address_numbers"].tolist()
-        
-        self._build_indexes()
-
-    def _build_indexes(self):
-        """Construct inverted indexes across multiple representations."""
-        # 1. Compute name and address token frequencies
-        for tokens in self.name_tokens:
-            for t in set(tokens):
-                if len(t) >= BLOCKING_CONFIG["min_token_len"]:
-                    self.token_frequencies[t] += 1
-
-        for tokens in self.address_tokens:
-            for t in set(tokens):
-                if len(t) >= 4:
-                    self.addr_token_frequencies[t] += 1
-
-        max_freq = int(self.total_records * BLOCKING_CONFIG["max_token_freq"])
-        frequent_name_tokens = {
-            t for t, freq in self.token_frequencies.items() if freq > max_freq
-        }
-        frequent_addr_tokens = {
-            t for t, freq in self.addr_token_frequencies.items() if freq > max_freq
-        }
-
-        # 2. Populate indexes
-        for idx in range(self.total_records):
-            name_no_sfx = self.name_no_suffixes[idx]
-            name_alnum = self.name_alnums[idx]
-            tokens = self.name_tokens[idx]
-            addr_tokens = self.address_tokens[idx]
-            addr_numbers = self.address_numbers[idx]
-
-            # Key 1: Exact clean name
-            if name_no_sfx:
-                self.exact_name_index[name_no_sfx].append(idx)
-
-            # Key 2: Alphanumeric compact name
-            if name_alnum and len(name_alnum) >= 4:
-                self.alnum_name_index[name_alnum].append(idx)
-
-            # Key 3: Distinctive name tokens
-            for t in set(tokens):
-                if len(t) >= BLOCKING_CONFIG["min_token_len"] and t not in frequent_name_tokens:
-                    self.name_token_index[t].append(idx)
-
-            # Key 4: Distinctive address tokens
-            for t in set(addr_tokens):
-                if len(t) >= 4 and t not in frequent_addr_tokens:
-                    self.addr_token_index[t].append(idx)
-
-            # Key 5: Name 2-token prefix key
-            if len(tokens) >= 2:
-                prefix_key = f"{tokens[0]}_{tokens[1]}"
-                self.name_prefix_index[prefix_key].append(idx)
-            elif len(tokens) == 1 and len(tokens[0]) >= 4:
-                self.name_prefix_index[tokens[0]].append(idx)
-
-            # Key 6: Address number + First name token
-            if addr_numbers and tokens:
-                first_tok = tokens[0]
-                if len(first_tok) >= 3:
-                    for num in addr_numbers[:2]:
-                        num_key = f"{num}_{first_tok}"
-                        self.addr_num_name_index[num_key].append(idx)
-
-            # Key 7: Name 3-grams for typo resilience
-            if name_alnum and len(name_alnum) >= 6:
-                for i in range(len(name_alnum) - 2):
-                    g = name_alnum[i:i+3]
-                    if self.token_frequencies.get(g, 0) <= max_freq:
-                        self.name_3gram_index[g].append(idx)
 
 
 def compute_quick_jaccard(tokens1: List[str], tokens2: List[str]) -> float:
@@ -118,112 +26,256 @@ def compute_quick_jaccard(tokens1: List[str], tokens2: List[str]) -> float:
     return intersection / len(s1 | s2)
 
 
-class BlockingEngine:
+class CountryBlockingIndex:
     """
-    Coordinates blocking across country partitions and sources.
+    Multi-channel inverted index and TF-IDF vector index for a single country partition.
     """
-    def __init__(self, target_df: pd.DataFrame):
-        """
-        target_df contains combined Source 2 and Source 3 preprocessed records.
-        """
-        self.target_df = target_df
-        # Partition target records by country
-        self.country_indices = {}
-        
-        countries = target_df["country"].unique()
-        for country in countries:
-            subset = target_df[target_df["country"] == country].reset_index(drop=True)
-            self.country_indices[country] = EntityIndex(subset)
-            logger.info(f"Built blocking index for country '{country}': {len(subset):,} records")
+    def __init__(self, country: str, target_df: pd.DataFrame):
+        self.country = country
+        self.total_records = len(target_df)
+        self.target_df = target_df.reset_index(drop=True)
 
-    def get_candidates_for_record(
+        self.entity_ids = self.target_df["entity_id"].tolist()
+        self.name_cores = self.target_df["name_core"].tolist()
+        self.name_compacts = self.target_df["name_compact"].tolist()
+        self.name_tokens = self.target_df["name_tokens"].tolist()
+        self.name_first_tokens = self.target_df["name_first_tokens"].tolist()
+        self.address_norms = self.target_df["address_norm"].tolist()
+        self.address_tokens = self.target_df["address_tokens"].tolist()
+        self.house_numbers = self.target_df["house_number"].tolist()
+        self.postal_codes = self.target_df["postal_code"].tolist()
+        self.states = self.target_df["state"].tolist()
+
+        # Inverted index channels
+        self.exact_core_index = defaultdict(list)     # Channel A
+        self.compact_name_index = defaultdict(list)   # Channel B
+        self.first_tokens_index = defaultdict(list)   # Channel C
+        self.rare_name_token_index = defaultdict(list)# Channel D
+        self.name_house_num_index = defaultdict(list) # Channel E
+        self.house_addr_token_index = defaultdict(list)# Channel F
+        self.postal_name_index = defaultdict(list)    # Channel G
+
+        self.name_token_freq = defaultdict(int)
+        self.addr_token_freq = defaultdict(int)
+
+        self.char_tfidf = None
+        self.char_tfidf_matrix = None
+        self.addr_tfidf = None
+        self.addr_tfidf_matrix = None
+
+        self._build_indexes()
+        self._build_tfidf_indexes()
+
+    def _build_indexes(self):
+        """Build channels A through G inverted indexes."""
+        for tokens in self.name_tokens:
+            for t in set(tokens):
+                if len(t) >= BLOCKING_CONFIG["min_token_len"]:
+                    self.name_token_freq[t] += 1
+
+        for tokens in self.address_tokens:
+            for t in set(tokens):
+                if len(t) >= 4:
+                    self.addr_token_freq[t] += 1
+
+        max_freq = int(self.total_records * BLOCKING_CONFIG["max_token_freq"])
+        frequent_name_tokens = {t for t, f in self.name_token_freq.items() if f > max_freq}
+        frequent_addr_tokens = {t for t, f in self.addr_token_freq.items() if f > max_freq}
+
+        for idx in range(self.total_records):
+            core = self.name_cores[idx]
+            compact = self.name_compacts[idx]
+            first_toks = self.name_first_tokens[idx]
+            n_tokens = self.name_tokens[idx]
+            a_tokens = self.address_tokens[idx]
+            h_nums = self.house_numbers[idx]
+            post_code = self.postal_codes[idx]
+            st = self.states[idx]
+
+            if core:
+                self.exact_core_index[core].append(idx)
+            if compact and len(compact) >= 4:
+                self.compact_name_index[compact].append(idx)
+            if first_toks:
+                self.first_tokens_index[first_toks].append(idx)
+
+            for t in set(n_tokens):
+                if len(t) >= BLOCKING_CONFIG["min_token_len"] and t not in frequent_name_tokens:
+                    self.rare_name_token_index[t].append(idx)
+
+            if h_nums and n_tokens:
+                for num in h_nums[:2]:
+                    for t in n_tokens[:2]:
+                        if len(t) >= 3:
+                            self.name_house_num_index[f"{num}_{t}"].append(idx)
+
+            if h_nums and a_tokens:
+                for num in h_nums[:2]:
+                    for at in a_tokens:
+                        if len(at) >= 4 and at not in frequent_addr_tokens:
+                            self.house_addr_token_index[f"{num}_{at}"].append(idx)
+
+            if (post_code or st) and n_tokens:
+                geo_key = post_code or st
+                for t in n_tokens[:2]:
+                    if len(t) >= 3:
+                        self.postal_name_index[f"{geo_key}_{t}"].append(idx)
+
+    def _build_tfidf_indexes(self):
+        """Build character & word TF-IDF vector matrices (Channels H, I, J)."""
+        if self.total_records < 5:
+            return
+
+        try:
+            cores_text = [c if c else "empty" for c in self.name_cores]
+            self.char_tfidf = TfidfVectorizer(
+                analyzer="char_wb",
+                ngram_range=BLOCKING_CONFIG["tfidf_char_ngram_range"],
+                max_features=BLOCKING_CONFIG["tfidf_max_features"],
+                dtype=np.float32,
+            )
+            self.char_tfidf_matrix = self.char_tfidf.fit_transform(cores_text)
+
+            addrs_text = [a if a else "empty" for a in self.address_norms]
+            self.addr_tfidf = TfidfVectorizer(
+                analyzer="word",
+                ngram_range=BLOCKING_CONFIG["tfidf_word_ngram_range"],
+                max_features=BLOCKING_CONFIG["tfidf_max_features"],
+                dtype=np.float32,
+            )
+            self.addr_tfidf_matrix = self.addr_tfidf.fit_transform(addrs_text)
+        except Exception as e:
+            logger.warning(f"TF-IDF indexing failed for country {self.country}: {e}")
+
+
+class MultiChannelBlockingEngine:
+    """
+    Coordinates multi-channel candidate generation across country partitions.
+    """
+    def __init__(self, targets_df: pd.DataFrame):
+        self.targets_df = targets_df
+        self.country_indices: Dict[str, CountryBlockingIndex] = {}
+        
+        countries = targets_df["country"].unique()
+        for country in countries:
+            subset = targets_df[targets_df["country"] == country]
+            self.country_indices[country] = CountryBlockingIndex(country, subset)
+            logger.info(f"Built blocking index for country '{country}': {len(subset):,} target records")
+
+    def retrieve_candidates_for_s1(
         self,
         s1_row: Any,
-        max_candidates: int = 35
-    ) -> List[Tuple[str, float]]:
+        top_k: int = TOP_K_CANDIDATES
+    ) -> List[Tuple[str, float, int]]:
         """
-        Retrieve candidate entity IDs for a single Source 1 record.
-        Returns list of (candidate_entity_id, preliminary_score).
+        Retrieve candidates for a single S1 entity using Channels A through G + fast heuristics.
         """
-        country = s1_row.country
+        country = getattr(s1_row, "country", "unknown")
+        
         if country not in self.country_indices:
-            # Open-set country with no targets in that country
-            return []
+            if not self.country_indices:
+                return []
+            country = max(self.country_indices.keys(), key=lambda k: self.country_indices[k].total_records)
 
         index = self.country_indices[country]
-        candidate_indices = set()
+        channel_hits = defaultdict(set)
 
-        # Strategy 1: Exact name no suffix
-        name_no_sfx = s1_row.name_no_suffix
-        if name_no_sfx:
-            candidate_indices.update(index.exact_name_index.get(name_no_sfx, []))
+        # Channel A: exact core name
+        core = getattr(s1_row, "name_core", "")
+        if core and core in index.exact_core_index:
+            for c_idx in index.exact_core_index[core]:
+                channel_hits[c_idx].add("ChA_ExactCore")
 
-        # Strategy 2: Alphanumeric name
-        name_alnum = s1_row.name_alnum
-        if name_alnum and len(name_alnum) >= 4:
-            candidate_indices.update(index.alnum_name_index.get(name_alnum, []))
+        # Channel B: compact name
+        compact = getattr(s1_row, "name_compact", "")
+        if compact and compact in index.compact_name_index:
+            for c_idx in index.compact_name_index[compact]:
+                channel_hits[c_idx].add("ChB_Compact")
 
-        # Strategy 3: 2-token prefix key
-        tokens = s1_row.name_tokens
-        if len(tokens) >= 2:
-            prefix_key = f"{tokens[0]}_{tokens[1]}"
-            candidate_indices.update(index.name_prefix_index.get(prefix_key, []))
-        elif len(tokens) == 1 and len(tokens[0]) >= 4:
-            candidate_indices.update(index.name_prefix_index.get(tokens[0], []))
+        # Channel C: first 2 core name tokens
+        first_toks = getattr(s1_row, "name_first_tokens", "")
+        if first_toks and first_toks in index.first_tokens_index:
+            for c_idx in index.first_tokens_index[first_toks]:
+                channel_hits[c_idx].add("ChC_FirstToks")
 
-        # Strategy 4: Distinctive name token overlap
-        for t in set(tokens):
-            if len(t) >= BLOCKING_CONFIG["min_token_len"]:
-                candidate_indices.update(index.name_token_index.get(t, []))
+        # Channel D: rare name tokens
+        n_tokens = getattr(s1_row, "name_tokens", [])
+        for t in set(n_tokens):
+            if len(t) >= BLOCKING_CONFIG["min_token_len"] and t in index.rare_name_token_index:
+                for c_idx in index.rare_name_token_index[t]:
+                    channel_hits[c_idx].add("ChD_RareNameTok")
 
-        # Strategy 5: Address number + First name token
-        addr_numbers = s1_row.address_numbers
-        if addr_numbers and tokens:
-            first_tok = tokens[0]
-            if len(first_tok) >= 3:
-                for num in addr_numbers[:2]:
-                    num_key = f"{num}_{first_tok}"
-                    candidate_indices.update(index.addr_num_name_index.get(num_key, []))
+        # Channel E: country + name token + house number
+        h_nums = getattr(s1_row, "house_number", [])
+        if h_nums and n_tokens:
+            for num in h_nums[:2]:
+                for t in n_tokens[:2]:
+                    key = f"{num}_{t}"
+                    if key in index.name_house_num_index:
+                        for c_idx in index.name_house_num_index[key]:
+                            channel_hits[c_idx].add("ChE_HouseNameTok")
 
-        # Strategy 6: Distinctive address token matches
-        addr_tokens = s1_row.address_tokens
-        for at in set(addr_tokens):
-            if len(at) >= 5:
-                # Add up to 50 targets per distinctive address token
-                cands = index.addr_token_index.get(at, [])
-                if len(cands) <= 50:
-                    candidate_indices.update(cands)
+        # Channel F: house number + rare address token
+        a_tokens = getattr(s1_row, "address_tokens", [])
+        if h_nums and a_tokens:
+            for num in h_nums[:2]:
+                for at in a_tokens:
+                    key = f"{num}_{at}"
+                    if key in index.house_addr_token_index:
+                        for c_idx in index.house_addr_token_index[key]:
+                            channel_hits[c_idx].add("ChF_HouseAddrTok")
 
-        if not candidate_indices:
+        # Channel G: postal code / state + name token
+        post_code = getattr(s1_row, "postal_code", "")
+        st = getattr(s1_row, "state", "")
+        if (post_code or st) and n_tokens:
+            geo_key = post_code or st
+            for t in n_tokens[:2]:
+                key = f"{geo_key}_{t}"
+                if key in index.postal_name_index:
+                    for c_idx in index.postal_name_index[key]:
+                        channel_hits[c_idx].add("ChG_GeoNameTok")
+
+        if not channel_hits:
             return []
 
-        # Rank and score candidates using composite similarity
         scored_candidates = []
-        s1_tokens = s1_row.name_tokens
-        s1_addr_tokens = s1_row.address_tokens
-        s1_nums = set(addr_numbers)
+        s1_h_nums = set(h_nums)
+        s1_post = post_code
+        s1_st = st
 
-        for c_idx in candidate_indices:
+        for c_idx, channels in channel_hits.items():
             c_eid = index.entity_ids[c_idx]
-            c_name_no_sfx = index.name_no_suffixes[c_idx]
-            c_name_tokens = index.name_tokens[c_idx]
-            c_addr_tokens = index.address_tokens[c_idx]
-            c_nums = set(index.address_numbers[c_idx])
+            c_core = index.name_cores[c_idx]
+            c_compact = index.name_compacts[c_idx]
+            c_n_tokens = index.name_tokens[c_idx]
+            c_a_tokens = index.address_tokens[c_idx]
+            c_h_nums = set(index.house_numbers[c_idx])
+            c_post = index.postal_codes[c_idx]
+            c_st = index.states[c_idx]
 
-            name_jaccard = compute_quick_jaccard(s1_tokens, c_name_tokens)
-            addr_jaccard = compute_quick_jaccard(s1_addr_tokens, c_addr_tokens)
-            num_overlap = 1.0 if (s1_nums and s1_nums & c_nums) else 0.0
+            name_jaccard = compute_quick_jaccard(n_tokens, c_n_tokens)
+            addr_jaccard = compute_quick_jaccard(a_tokens, c_a_tokens)
             
-            is_exact = 1.0 if (name_no_sfx and name_no_sfx == c_name_no_sfx) else 0.0
-            
+            is_exact_core = 1.0 if (core and core == c_core) else 0.0
+            is_exact_compact = 1.0 if (compact and compact == c_compact) else 0.0
+            num_match = 1.0 if (s1_h_nums and s1_h_nums & c_h_nums) else 0.0
+            post_match = 1.0 if (s1_post and s1_post == c_post) else 0.0
+            state_match = 1.0 if (s1_st and s1_st == c_st) else 0.0
+
+            channel_support = len(channels)
+
             total_score = (
-                is_exact * 2.5
-                + name_jaccard * 2.0
+                is_exact_core * 3.5
+                + is_exact_compact * 2.0
+                + name_jaccard * 3.0
                 + addr_jaccard * 1.5
-                + num_overlap * 0.8
+                + num_match * 1.0
+                + post_match * 1.0
+                + state_match * 0.5
+                + channel_support * 0.8
             )
-            scored_candidates.append((c_eid, total_score))
+            scored_candidates.append((c_eid, total_score, channel_support))
 
-        # Sort descending by score
         scored_candidates.sort(key=lambda x: x[1], reverse=True)
-        return scored_candidates[:max_candidates]
+        return scored_candidates[:top_k]
